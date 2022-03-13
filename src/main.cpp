@@ -14,6 +14,41 @@
 unsigned long sketchTime = 0;
 
 ////////////////////////////////
+// Program state
+////////////////////////////////
+enum STATE {
+  INIT,
+  WAIT,
+  WAKEUP,
+  RECEIVING,
+  MANAGE,
+  SEND,
+  BROKER,
+  DATA,
+  SLEEP,
+  ERROR
+};
+
+volatile STATE state = INIT;
+volatile STATE prevState;
+
+void stateToStr(char *text){
+  switch(state) {
+    case INIT:      strcpy(text, "INIT"); break;
+    case WAIT:      strcpy(text, "WAIT"); break;
+    case WAKEUP:    strcpy(text, "WAKEUP"); break;
+    case RECEIVING: strcpy(text, "RECEIVING"); break;
+    case MANAGE:    strcpy(text, "MANAGE"); break;
+    case SEND:      strcpy(text, "SEND"); break;
+    case BROKER:    strcpy(text, "BROKER"); break;
+    case DATA:      strcpy(text, "DATA"); break;
+    case SLEEP:     strcpy(text, "SLEEP"); break;
+    case ERROR:     strcpy(text, "ERROR"); break;
+    default:        strcpy(text, "UNKNOWN"); break;
+  }
+}
+
+////////////////////////////////
 // OLED
 ////////////////////////////////
 #include <Wire.h>
@@ -110,85 +145,6 @@ static const unsigned char PROGMEM noWiFiLogo[] =
   B00000001, B10001110 };
 
 ////////////////////////////////
-// RTC
-// ////////////////////////////////
-// #include <RTClib.h>
-// RTC_DS3231 rtc;
-
-// DateTime lastReceived;
-
-////////////////////////////////
-// LED
-////////////////////////////////
-#define LED_PIN 2
-
-void blink(int nb, int ms = 100) {
-  for (int i=0 ; i<nb ; i++) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(ms);
-    digitalWrite(LED_PIN, LOW);
-    delay(ms);
-  }
-}
-
-////////////////////////////////
-// Voltage & Current SENSOR
-////////////////////////////////
-#define LIPOBAT_PIN 27
-
-uint32_t lipoBat=0;
-int16_t maxGlobalCurrent = 0;
-float currentList[10] = {0};
-float averageCurrent = 0;
-//long int numiter = 0;
-long int numCollect = 0;
-
-bool collectData();
-
-////////////////////////////////
-// Program state
-////////////////////////////////
-enum STATE {
-  INIT,
-  WAIT,
-  WAKEUP,
-  RECEIVING,
-  MANAGE,
-  SEND,
-  BROKER,
-  DATA,
-  SLEEP,
-  ERROR
-};
-
-volatile STATE state = INIT;
-volatile STATE prevState;
-
-void stateToStr(char *text){
-  switch(state) {
-    case INIT:      strcpy(text, "INIT"); break;
-    case WAIT:      strcpy(text, "WAIT"); break;
-    case WAKEUP:    strcpy(text, "WAKEUP"); break;
-    case RECEIVING: strcpy(text, "RECEIVING"); break;
-    case MANAGE:    strcpy(text, "MANAGE"); break;
-    case SEND:      strcpy(text, "SEND"); break;
-    case BROKER:    strcpy(text, "BROKER"); break;
-    case DATA:      strcpy(text, "DATA"); break;
-    case SLEEP:     strcpy(text, "SLEEP"); break;
-    case ERROR:     strcpy(text, "ERROR"); break;
-    default:        strcpy(text, "UNKNOWN"); break;
-  }
-}
-
-
-////////////////////////////////
-// JSon
-////////////////////////////////
-#include <ArduinoJson.h>
-
-//StaticJsonDocument<200> doc;
-
-////////////////////////////////
 // LORA
 ////////////////////////////////
 #include <LoRa.h>
@@ -267,6 +223,71 @@ bool WiFiConnect() {
   return retval;
 }
 
+
+/////////////////////////////////////////////////////
+// OTA
+/////////////////////////////////////////////////////
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
+
+AsyncWebServer server(80);
+
+void initOTA(){
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "Hi! I am ESP32.");
+  });
+
+  AsyncElegantOTA.begin(&server);    // Start ElegantOTA
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+
+////////////////////////////////
+// RTC
+// ////////////////////////////////
+// #include <RTClib.h>
+// RTC_DS3231 rtc;
+
+// DateTime lastReceived;
+
+////////////////////////////////
+// LED
+////////////////////////////////
+#define LED_PIN 2
+
+void blink(int nb, int ms = 100) {
+  for (int i=0 ; i<nb ; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(ms);
+    digitalWrite(LED_PIN, LOW);
+    delay(ms);
+  }
+}
+
+////////////////////////////////
+// Voltage & Current SENSOR
+////////////////////////////////
+#define LIPOBAT_PIN 27
+
+uint32_t lipoBat=0;
+int16_t maxGlobalCurrent = 0;
+float currentList[10] = {0};
+float averageCurrent = 0;
+//long int numiter = 0;
+long int numCollect = 0;
+
+bool collectData();
+
+
+////////////////////////////////
+// JSon
+////////////////////////////////
+#include <ArduinoJson.h>
+
+//StaticJsonDocument<200> doc;
+
 ////////////////////////////////
 // NTP
 ////////////////////////////////
@@ -313,15 +334,9 @@ bool reconnect();
 
 void displayStats();
 
-////////////////////////////////////////////////////
-// OTA
-////////////////////////////////////////////////////
-// #include <ArduinoOTA.h>
-
 /////////////////////////////////////////
 // ADS1115
 /////////////////////////////////////////
-// #include "Adafruit_ADS1015.h"
 #include "ADS1115.h"
 
 #define I2Caddress 0x48
@@ -463,6 +478,9 @@ void setup() {
   // WiFi init
   WiFi.begin(AP_NAME, AP_PASSRHRASE);
   WiFi.onEvent (onWifiEvent);
+
+  // OTA
+  initOTA();
 
   // Init MQTT Client
   mqttClient.setServer(mqtt_server_ip,mqtt_server_port);
