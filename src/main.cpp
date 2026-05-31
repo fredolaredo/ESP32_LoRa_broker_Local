@@ -42,6 +42,7 @@ enum STATE {
 
 volatile STATE state = INIT;
 volatile STATE prevState;
+volatile int receivedPacketSize = 0;  // Store packet size from interrupt
 
 void stateToStr(char *text){
   switch(state) {
@@ -101,7 +102,15 @@ void LoRa_sendMessage() {
   Serial.println(textSend);
 }
 
-// LoRa interrupt handler for hardware IRQ pin
+// LoRa receive callback
+void onReceive(int packetSize) {
+  portENTER_CRITICAL_ISR(&mux);
+  receivedPacketSize = packetSize;
+  state = RECEIVING;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+// LoRa interrupt handler for hardware IRQ pin (kept for compatibility but not used)
 void IRAM_ATTR onLoRaInterrupt() {
   portENTER_CRITICAL_ISR(&mux);
   state = RECEIVING;
@@ -121,14 +130,12 @@ void initLoRa(){
     while (true);
   }
   
-  // Attach hardware interrupt for LoRa IRQ pin
-  pinMode(LORA_IRQ, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(LORA_IRQ), onLoRaInterrupt, RISING);
-  
+  // Use LoRa library's built-in interrupt handling
+  LoRa.onReceive(onReceive);
   LoRa.onTxDone(onTxDone);
   LoRa_rxMode();
   
-  Serial.println("LoRa initialized with hardware interrupt on pin " + String(LORA_IRQ));
+  Serial.println("LoRa started OK in receive mode");
 }
 
 //////////////////////////////
@@ -475,7 +482,9 @@ void loop() {
     break;
 
   case RECEIVING: {
-    int packetSize = LoRa.parsePacket();
+    // Packet size was already set by onReceive() callback
+    int packetSize = receivedPacketSize;
+    receivedPacketSize = 0;  // Reset for next packet
     
     if (packetSize > 0) {
       state = MANAGE;
