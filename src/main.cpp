@@ -6,16 +6,27 @@
 
 #define DEBUG
 
-//SPI
-#define SCK  18   
-#define MISO 19
-#define MOSI 23
+// specifique TTGO lora OLED pins
+// I2C OLED Display works with SSD1306 driver
+#define OLED_SDA   4
+#define OLED_SCL  15
+#define OLED_RST  16
+
+// SPI LoRa Radio
+#define LORA_SCK   5      // GPIO5  - SX1276 SCK
+#define LORA_MISO 19      // GPIO19 - SX1276 MISO
+#define LORA_MOSI 27      // GPIO27 - SX1276 MOSI
+#define LORA_CS   18      // GPIO18 - SX1276 CS
+#define LORA_RST  14      // GPIO14 - SX1276 RST
+#define LORA_IRQ  26      // GPIO26 - SX1276 IRQ (interrupt request)
 
 unsigned long sketchTime = 0;
 
-////////////////////////////////
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+//////////////////////////////
 // Program state
-////////////////////////////////
+//////////////////////////////
 enum STATE {
   INIT,
   WAIT,
@@ -48,153 +59,113 @@ void stateToStr(char *text){
   }
 }
 
-////////////////////////////////
-// OLED
-////////////////////////////////
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_I2CDevice.h>
-
-//OLED pins
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
-
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire);
-
-boolean invert_display = false;
-
-void initOLED () {
-  Wire.begin(SDA, SCL);
-  if(!display.begin(0x02, 0x3c, false, false)) {
-  #ifdef DEBUG
-    Serial.println(F("SSD1306 allocation failed"));
-  #endif
-    for(;;); // Don't proceed, loop forever
-  }
-  display.ssd1306_command(/*SSD1306_DISPLAYON*/ 0xAF);
-  display.clearDisplay();
-  display.setRotation(0);
-  display.setTextColor(1);
-  display.setTextSize(1);
-  // display.startscrollright(0x00, 0x0F);
-  display.display();
-}
-
-#define LORA_HEIGHT   24
-#define LORA_WIDTH    16
-static const unsigned char PROGMEM LoRaLogo[] =
-{ B00000011, B11000000,
-  B00111111, B11111100,
-  B11110000, B00001111,
-  B01000011, B11000010,
-  B00011111, B11111000,
-  B00110000, B00001100,
-  B00000111, B11100000,
-  B00011000, B00011000,
-  B00000011, B11000000,
-  B00000110, B01100000,
-  B00001100, B00110000,
-  B00001100, B00110000,
-  B00001100, B00110000,
-  B00001100, B00110000,
-  B00000110, B01100000,
-  B00000011, B11000000,
-  B00011000, B00011000,
-  B00000111, B11100000,
-  B00110000, B00001100,
-  B00011111, B11111000,
-  B01000011, B11000010,
-  B11110000, B00011111,
-  B00111111, B11111100,
-  B00000111, B11100000 };
-
-
-#define WIFI_HEIGHT   13
-#define WIFI_WIDTH    16
-static const unsigned char PROGMEM WiFiLogo[] =
-{ B00000111, B11100000,
-  B00111111, B11111100,
-  B01111000, B00011110,
-  B11100111, B11100111,
-  B00011111, B11111000,
-  B00111100, B00111100,
-  B00000011, B11000000,
-  B00000111, B11100000,
-  B00000100, B00000000,
-  B00000001, B10000000,
-  B00000011, B11000000,
-  B00000011, B11000000,
-  B00000001, B10000000 };
-
-#define NOWIFI_HEIGHT   13
-#define NOWIFI_WIDTH    16
-static const unsigned char PROGMEM noWiFiLogo[] =
-{ B11100111, B11100000,
-  B01111111, B11111100,
-  B01111000, B00011110,
-  B11111111, B11100111,
-  B00011111, B11111000,
-  B00111111, B00111100,
-  B00000011, B11000000,
-  B00000111, B11100000,
-  B00000100, B11100000,
-  B00000001, B11110000,
-  B00000011, B11111000,
-  B00000011, B11011100,
-  B00000001, B10001110 };
-
-////////////////////////////////
-// LORA
-////////////////////////////////
+//////////////////////////////////////
+// LoRa 
+//////////////////////////////////////
+#include <SPI.h>
 #include <LoRa.h>
-#define BAND 870E6
-#define SF   7
-#define SS   4
-#define RST  33
-#define DIO0 32
-// #define DIO1 35
 
-int packetSize;
+#define LORA_BAND                                   870E6    // Hz
+#define LORA_TX_POWER                               20        // dBm
+#define LORA_BANDWIDTH                              125E3     
+#define LORA_SPREADING_FACTOR                       7         // [SF7..SF12]
+#define LORA_CODINGRATE_DENOMINATOR                 5         // 4/5
 
-void onReceive(int packetSize) {
-  // received a packet
-  Serial.printf("------ Received Packet : %d bytes\n",packetSize);
-  state = RECEIVING;
+String textSend, textRecv ;
+
+const uint8_t LoRa_buffer_size = 128; // Define the payload size here
+char txpacket[LoRa_buffer_size];
+
+void IRAM_ATTR onSend() {
+  portENTER_CRITICAL_ISR(&mux);
+  state = SEND;
+  portEXIT_CRITICAL_ISR(&mux);
 }
 
-////////////////////////////////
+void LoRa_rxMode(){
+  LoRa.disableInvertIQ();               // normal mode
+  LoRa.receive();                       // set receive mode
+}
+
+void onTxDone() {
+  portENTER_CRITICAL_ISR(&mux);
+  //state = SENT;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void LoRa_sendMessage() {
+  LoRa.beginPacket();                 // start packet
+  LoRa.print(textSend);               // add payload
+  LoRa.endPacket(true);               // finish packet and send it
+  Serial.println("send message => "); 
+  Serial.println(textSend);
+}
+
+// LoRa interrupt handler for hardware IRQ pin
+void IRAM_ATTR onLoRaInterrupt() {
+  portENTER_CRITICAL_ISR(&mux);
+  state = RECEIVING;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void initLoRa(){
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_IRQ);
+  
+  if (!LoRa.begin(LORA_BAND)) {
+    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
+    LoRa.setCodingRate4(LORA_CODINGRATE_DENOMINATOR);
+    LoRa.setSignalBandwidth(LORA_BANDWIDTH);
+    LoRa.setTxPower(LORA_TX_POWER);
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true);
+  }
+  
+  // Attach hardware interrupt for LoRa IRQ pin
+  pinMode(LORA_IRQ, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(LORA_IRQ), onLoRaInterrupt, RISING);
+  
+  LoRa.onTxDone(onTxDone);
+  LoRa_rxMode();
+  
+  Serial.println("LoRa initialized with hardware interrupt on pin " + String(LORA_IRQ));
+}
+
+//////////////////////////////
 // WiFi
-////////////////////////////////
+//////////////////////////////
 #include <WiFi.h>
 #include <WiFiClient.h>
 
 WiFiClient wifiClient; 
 
-void onWifiEvent (system_event_id_t event, system_event_info_t info) {
+void onWifiEvent (arduino_event_t* event) {
 #ifdef DEBUG
-    Serial.printf ("[WiFi-event] event: %d - ", event);
-    switch (event) {
-    case SYSTEM_EVENT_WIFI_READY:    
+    Serial.printf ("[WiFi-event] event: %d - ", event->event_id);
+    switch (event->event_id) {
+    case ARDUINO_EVENT_WIFI_READY:    
       Serial.printf ("WiFi ready\n"); 
       break;
-    case SYSTEM_EVENT_STA_START:     
-      Serial.printf ("WiFi start\n"); 
+    case ARDUINO_EVENT_WIFI_SCAN_DONE:     
+      Serial.printf ("WiFi scan done\n"); 
       break;
-    case SYSTEM_EVENT_STA_CONNECTED:
-      Serial.printf ("Connected to %s. Asking for IP address\n", info.connected.ssid);
+    case ARDUINO_EVENT_WIFI_STA_START:
+      Serial.printf ("WiFi station start\n");
       break;
-    case SYSTEM_EVENT_STA_STOP:
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.printf ("Connected to SSID\n");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_STOP:
       Serial.printf ("Station Stop\n");
       break;
-    case SYSTEM_EVENT_STA_LOST_IP:
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
       Serial.printf ("Lost IP\n");
       break;
-    case SYSTEM_EVENT_STA_GOT_IP:
-      Serial.printf ("Got IP: %s\n", IPAddress (info.got_ip.ip_info.ip.addr).toString ().c_str ());
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf ("Got IP: %s\n", IPAddress (event->event_info.got_ip.ip_info.ip.addr).toString ().c_str ());
       break;
-    case SYSTEM_EVENT_STA_DISCONNECTED: 
-      Serial.printf ("Disconnected from SSID: %s\n", info.disconnected.ssid);
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: 
+      Serial.printf ("Disconnected from SSID\n");
       break;
 		default:
       Serial.printf ("Unknown event\n");
@@ -223,162 +194,55 @@ bool WiFiConnect() {
   return retval;
 }
 
-
-/////////////////////////////////////////////////////
-// OTA
-/////////////////////////////////////////////////////
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncElegantOTA.h>
-
-AsyncWebServer server(80);
-
-void initOTA(){
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/plain", "Hi! I am ESP32.");
-  });
-
-  AsyncElegantOTA.begin(&server);    // Start ElegantOTA
-  server.begin();
-  Serial.println("HTTP server started");
-}
-
-
-////////////////////////////////
-// RTC
-// ////////////////////////////////
-// #include <RTClib.h>
-// RTC_DS3231 rtc;
-
-// DateTime lastReceived;
-
-////////////////////////////////
-// LED
-////////////////////////////////
-#define LED_PIN 2
-
-void blink(int nb, int ms = 100) {
-  for (int i=0 ; i<nb ; i++) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(ms);
-    digitalWrite(LED_PIN, LOW);
-    delay(ms);
-  }
-}
-
-////////////////////////////////
-// Voltage & Current SENSOR
-////////////////////////////////
-#define LIPOBAT_PIN 27
-
-uint32_t lipoBat=0;
-int16_t maxGlobalCurrent = 0;
-float currentList[10] = {0};
-float averageCurrent = 0;
-//long int numiter = 0;
-long int numCollect = 0;
-
-bool collectData();
-
-
-////////////////////////////////
+//////////////////////////////
 // JSon
-////////////////////////////////
+//////////////////////////////
 #include <ArduinoJson.h>
 
-//StaticJsonDocument<200> doc;
+/////////////////////////////////
+// OLED Display
+/////////////////////////////////
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-////////////////////////////////
-// NTP
-////////////////////////////////
-#include <WiFiUdp.h>
-#include <NTPClient.h>
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "fr.pool.ntp.org", 3600, 60000);
+// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+bool displayFound = false;
 
-time_t lastReceived;
+/////////////////////////////////
+// InfluxDB3
+/////////////////////////////////
+#include <HTTPClient.h>
 
-////////////////////////////////
-// MQTT
-////////////////////////////////
-#include <PubSubClient.h>
-
-const char* mqtt_server_ip = MQTT_SERVER;
-const int   mqtt_server_port = MQTT_PORT;
-const char* mqtt_server_username = MQTT_LOGIN ;
-const char* mqtt_server_password = MQTT_PASSWD ;
-
-PubSubClient mqttClient(wifiClient);
+const char* influxdb_server = INFLUXDB_SERVER;
+int influxdb_port = INFLUXDB_PORT;
+const char* influxdb_token = INFLUXDB_TOKEN;
+const char* influxdb_db = INFLUXDB_DB;
 
 String message;
 String device = "N/A";
 
-bool sendBrokerData();
-bool sendMQTT();
+bool sendInfluxDB3();
 bool managePacket(String message);
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  #ifdef DEBUG
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
-  }
-  Serial.println();
-  #endif
-}
-
-bool reconnect();
-
-void displayStats();
-
-/////////////////////////////////////////
-// ADS1115
-/////////////////////////////////////////
-#include "ADS1115.h"
-
-#define I2Caddress 0x48
-#define ADS1115_READY_PIN 25
-
-ADS1115 adc0(/*ADS1115_DEFAULT_ADDRESS*/ 0x48);
-
-void initADC(){
-  #ifdef DEBUG
-  Serial.println("Testing device connections...");
-  Serial.println(adc0.testConnection() ? "ADS1115 connection successful" : "ADS1115 connection failed");
-  #endif
-  
-  adc0.initialize();
-  adc0.setMode(/*ADS1115_MODE_SINGLESHOT*/ 0x01);
-  adc0.setRate(/*ADS1115_RATE_64*/ 0x03);
-  adc0.setGain(/*ADS1115_PGA_6P144*/ 0x00);
-  
-  // ALERT/RDY pin will indicate when conversion is ready
-  // pinMode(ADS1115_READY_PIN,INPUT);
-  // adc0.setConversionReadyPinMode();
-
-  // To get output from this method, you'll need to turn on the 
-  //#define ADS1115_SERIAL_DEBUG // in the ADS1115.h file
-  // adc0.showConfigRegister();
-  // Serial.print("HighThreshold="); Serial.println(adc0.getHighThreshold(),BIN);
-  // Serial.print("LowThreshold="); Serial.println(adc0.getLowThreshold(),BIN);
-}
-
-
-////////////////////////////////
+//////////////////////////////
 // Interrupts
-////////////////////////////////
+//////////////////////////////
 #include <esp_sleep.h>
 #define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
-#define BUTTON_PIN 26
-
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+#define BUTTON_PIN 12
 
 hw_timer_t *timer = NULL;
 
 hw_timer_t *timer2 = NULL;
+
+// For display timeout
+unsigned long lastDisplayUpdate = 0;
+#define DISPLAY_TIMEOUT 10000 // 10 seconds
 
 struct Button {
     const uint8_t PIN;
@@ -395,17 +259,11 @@ void IRAM_ATTR isr(void* arg) {
     state = SEND;
 }
 
-void IRAM_ATTR LoraIRQ() {
-  portENTER_CRITICAL_ISR(&mux);
-  state = WAKEUP;
-  portEXIT_CRITICAL_ISR(&mux);
-}
 
 #define TIME_TO_SEND_BROKER_DATA 60
 
 void IRAM_ATTR onBrokerTimer() {
   portENTER_CRITICAL_ISR(&mux);
-  //numiter++;
   prevState=state;
   state = BROKER;
   portEXIT_CRITICAL_ISR(&mux);
@@ -416,7 +274,6 @@ void IRAM_ATTR onBrokerTimer() {
 void IRAM_ATTR onDataTimer() {
   portENTER_CRITICAL_ISR(&mux);
   prevState = state;
-  numCollect++;
   state = DATA;
   portEXIT_CRITICAL_ISR(&mux);
 }
@@ -441,74 +298,146 @@ void print_wakeup_reason(){
   #endif
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // SETUP
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void setup() {
   #ifdef DEBUG
   Serial.begin(115200);
   #endif
 
-  // pinMode(LIPOBAT_PIN, INPUT_PULLUP);
-  // pinMode(LED_PIN, OUTPUT);
-
-  // pinMode(button1.PIN, INPUT_PULLUP);
-  // attachInterruptArg(button1.PIN, isr, &button1, FALLING);
-
-  //attachInterrupt(digitalPinToInterrupt(DIO0), LoraIRQ, RISING);
+  // Initialize OLED display and run test
+  delay(200); // Give more time for power to stabilize
+  
+  Serial.println("=== OLED Display Troubleshooting ===");
+  Serial.print("SDA pin: "); Serial.println(OLED_SDA);
+  Serial.print("SCL pin: "); Serial.println(OLED_SCL);
+  Serial.print("RST pin: "); Serial.println(OLED_RST);
+  
+  // Configure reset pin if needed
+  pinMode(OLED_RST, OUTPUT);
+  digitalWrite(OLED_RST, HIGH);
+  delay(50);
+  digitalWrite(OLED_RST, LOW);
+  delay(50);
+  digitalWrite(OLED_RST, HIGH);
+  delay(50);
+  
+  Wire.begin(OLED_SDA, OLED_SCL);
+  
+  // Try all possible I2C addresses for SSD1306
+  uint8_t addresses[] = {0x3C, 0x3D, 0x78, 0x7A};
+  
+  for (uint8_t addr : addresses) {
+    Serial.print("Trying address 0x");
+    Serial.println(addr, HEX);
+    if(!display.begin(SSD1306_SWITCHCAPVCC, addr)) {
+      Serial.print("  Failed at 0x");
+      Serial.println(addr, HEX);
+    } else {
+      displayFound = true;
+      Serial.print("  SUCCESS! Found at 0x");
+      Serial.println(addr, HEX);
+      // Increase display brightness
+      display.ssd1306_command(SSD1306_SETCONTRAST);
+      display.ssd1306_command(0xFF); // Maximum brightness
+      break;
+    }
+  }
+  
+  if (displayFound) {
+    Serial.println("Display found! Configuring...");
+    
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.cp437(true); // Use full 256 char 'Code Page 437' font
+    
+    display.println("OLED TEST");
+    display.println("ESP32");
+    display.println("LoRa32");
+    display.println("Working!");
+    
+    display.display();
+    Serial.println("Test pattern displayed");
+    
+    unsigned long startTime = millis();
+    while (millis() - startTime < 10000) {
+      delay(100);
+      if ((millis() / 500) % 2 == 0) {
+        display.drawPixel(120, 56, SSD1306_WHITE);
+      } else {
+        display.drawPixel(120, 56, SSD1306_BLACK);
+      }
+      display.display();
+    }
+    
+    display.clearDisplay();
+    display.display();
+    Serial.println("OLED test completed");
+    
+  } else {
+    Serial.println("ERROR: No SSD1306 display found!");
+    Serial.println("Starting I2C bus scan...");
+    
+    byte error, address;
+    int nDevices = 0;
+    for(address = 1; address < 127; address++ ) {
+      Wire.beginTransmission(address);
+      error = Wire.endTransmission();
+      if (error == 0) {
+        Serial.print("I2C device found at address 0x");
+        if (address < 16) Serial.print("0");
+        Serial.println(address, HEX);
+        nDevices++;
+      } else if (error == 4) {
+        Serial.print("Unknown error at address 0x");
+        if (address < 16) Serial.print("0");
+        Serial.println(address, HEX);
+      }
+    }
+    
+    if (nDevices == 0) {
+      Serial.println("No I2C devices found!");
+    } else {
+      Serial.print("Found ");
+      Serial.print(nDevices);
+      Serial.println(" I2C device(s)");
+    }
+    
+    Serial.println("Trying alternative initialization...");
+    for (uint8_t addr : addresses) {
+      Serial.print("Trying external VCC at 0x");
+      Serial.println(addr, HEX);
+      if(display.begin(SSD1306_EXTERNALVCC, addr)) {
+        Serial.println("SUCCESS with external VCC!");
+        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("EXT VCC");
+        display.println("Working!");
+        display.display();
+        delay(5000);
+        break;
+      }
+    }
+  }
 
   print_wakeup_reason();
-  //pinMode(GPIO_NUM_32,INPUT_PULLDOWN);
-
-  initOLED();
-
-  // init timer to send broker Data 
-  timer = timerBegin(1, 80, true);
-  timerAttachInterrupt(timer, &onBrokerTimer, true);
-  timerAlarmWrite(timer, TIME_TO_SEND_BROKER_DATA * uS_TO_S_FACTOR, true);
-  timerAlarmEnable(timer);
-
-  // init timer to collect Data 
-  timer2 = timerBegin(2, 80, true);
-  timerAttachInterrupt(timer2, &onDataTimer, true);
-  timerAlarmWrite(timer2, TIME_TO_COLLECT_DATA * uS_TO_S_FACTOR, true);
-  timerAlarmEnable(timer2);
 
   // WiFi init
   WiFi.begin(AP_NAME, AP_PASSRHRASE);
-  WiFi.onEvent (onWifiEvent);
+  WiFi.onEvent (onWifiEvent, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent (onWifiEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
-  // OTA
-  initOTA();
+  initLoRa();
 
-  // Init MQTT Client
-  mqttClient.setServer(mqtt_server_ip,mqtt_server_port);
-  //mqttLocalClient.setServer(mqtt_local_ip,mqtt_local_port);
-  
-  // Init LoRa 
-  LoRa.setPins(SS,RST,DIO0);
-  while (!LoRa.begin(BAND)) {
-    #ifdef DEBUG
-    Serial.println("Starting LoRa failed!");
-    #endif
-    state = ERROR;
-    delay(2000);
-  }
-
-  LoRa.onReceive(onReceive);
-  LoRa.receive();
   #ifdef DEBUG
-  Serial.println("LoRa started OK in recieve mode");
+  Serial.println("LoRa started OK in receive mode");
   #endif
-
-  // NTPClient init
-  timeClient.begin();
-  #ifdef DEBUG
-  Serial.println("NTPClient started");
-  #endif
-
-  initADC();
   
   #ifdef DEBUG
   Serial.println("--------- SETUP ENDED ---------");
@@ -516,9 +445,9 @@ void setup() {
 
 }
 
-////////////////////////////////
+//////////////////////////////
 // LOOP
-////////////////////////////////
+//////////////////////////////
 
 void loop() {
 
@@ -526,42 +455,79 @@ void loop() {
 
   switch (state) {
   case INIT:
-    if(WiFi.isConnected()) timeClient.update();
-    delay(1000);
     state=WAIT;
     break;
   
   case ERROR:
-    if(WiFi.isConnected()) WiFi.disconnect();
-    //if(LoRa.available()) LoRa.flush();
+    delay(5000);
+    state = WAIT;
     break;
 
   case WAIT:
-    if(WiFi.isConnected()) timeClient.update();
+    // Check if display timeout has expired
+    if (displayFound && (millis() - lastDisplayUpdate) > DISPLAY_TIMEOUT) {
+      display.startscrollright(0x00, 0x0F);
+      delay(10000); // Scroll for 10 seconds
+      display.stopscroll();
+      display.clearDisplay();
+      display.display();
+    }
     break;
 
-  case RECEIVING:
-    state = MANAGE;
-    message.clear();
-    while (LoRa.available()) {
-      message += (char)LoRa.read();
-      if(message.length() > 200) {
-        #ifdef DEBUG
-        Serial.println("Message too long !");
-        #endif
-        LoRa.flush();
-        state=ERROR;
-        break;
+  case RECEIVING: {
+    int packetSize = LoRa.parsePacket();
+    
+    if (packetSize > 0) {
+      state = MANAGE;
+      message.clear();
+      
+      while (LoRa.available()) {
+        message += (char)LoRa.read();
+        if(message.length() > 200) {
+          #ifdef DEBUG
+          Serial.println("Message too long !");
+          #endif
+          LoRa.flush();
+          state = ERROR;
+          break;
+        }
       }
+      
+      #ifdef DEBUG
+      Serial.print("Received packet, size: ");
+      Serial.print(packetSize);
+      Serial.print(", RSSI: ");
+      Serial.print(LoRa.packetRssi());
+      Serial.print(", SNR: ");
+      Serial.print(LoRa.packetSnr());
+      Serial.println(" dB");
+      Serial.print("Message: ");
+      Serial.println(message);
+      #endif
+    } else {
+      // No valid packet, go back to WAIT
+      state = WAIT;
     }
-    #ifdef DEBUG
-    Serial.println(message);
-    #endif
+    
+    // Display received packet info on OLED
+    if (displayFound) {
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("Packet");
+      display.setCursor(0, 16);
+      display.printf("Dev:%s", device.c_str());
+      display.setCursor(0, 32);
+      display.printf("Size:%d", message.length());
+      
+      display.display();
+      lastDisplayUpdate = millis();
+    }
     break;
+  }
   
   case MANAGE:
-    invert_display = invert_display ? false : true; 
-    lastReceived = timeClient.getEpochTime();
     state=SEND;
     if (!managePacket(message)) { 
       state = ERROR;
@@ -571,32 +537,20 @@ void loop() {
 
   case SEND:
     state = WAIT;
-    if (!sendMQTT()) { 
+    if (!sendInfluxDB3()) { 
       state = ERROR;
-      device = "SEND Err";
     }
-    WiFi.disconnect(true);
     break;
 
   case BROKER:
     state=WAIT;
-    displayStats();
-    if (!sendBrokerData()) {
-      state = ERROR;
-      device = "Broker Err";
-    }
-    WiFi.disconnect(true);
     break;
 
   case DATA:
-    //Serial.println("--> collect data");
-    collectData();
     state = prevState;
     break;
 
   case SLEEP:
-    display.clearDisplay();
-    display.display();
     Serial.flush();
     LoRa.flush();
     LoRa.end();
@@ -606,21 +560,17 @@ void loop() {
     break;
 
   default:
-    displayStats();
     #ifdef DEBUG
       Serial.println("State unknown !");
     #endif
     break;
   }
 
-  displayStats();
+}
 
-} 
-
-
-////////////////////////////////
+//////////////////////////////
 // Manage LoRa / JSon Packet
-////////////////////////////////
+//////////////////////////////
 
 bool managePacket(String message) {
 
@@ -630,7 +580,7 @@ bool managePacket(String message) {
   #endif
   bool retval=true;
 
-  StaticJsonDocument<200> doc;
+  JsonDocument doc;
   DeserializationError Derror = deserializeJson(doc, message);
   #ifdef DEBUG
   Serial.print("Deserialization : "); Serial.println(Derror.c_str());
@@ -657,316 +607,105 @@ bool managePacket(String message) {
   return retval;
 }
 
-////////////////////////////////
-// Send data
-////////////////////////////////
+/////////////////////////////////
+// Send data to InfluxDB3
+/////////////////////////////////
 
-#define WAIT 150
-
-bool sendMQTT() {
+bool sendInfluxDB3() {
   #ifdef DEBUG
-  Serial.println("--> Publish MQTT");
+  Serial.println("--> Send to InfluxDB3");
   #endif
   bool retval = true;
-  StaticJsonDocument<200> doc;
-  char topic[64];
-  //char topicLocal[64];
-  char payload[64];
-
-  if (!mqttClient.connected()) reconnect();
-  //if (!mqttLocalClient.connected()) reconnect();
-
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!WiFiConnect()) {
+      #ifdef DEBUG
+      Serial.println("WiFi connection failed for InfluxDB3");
+      #endif
+      return false;
+    }
+  }
+  
+  JsonDocument doc;
   DeserializationError Derror = deserializeJson(doc, message);
   if (Derror) {
     #ifdef DEBUG
-    Serial.println("Deserialization FAILED ");
+    Serial.println("Deserialization FAILED for InfluxDB3");
     #endif
     return false;
-  } else {
-    Serial.println("Deserialization OK ");
   }
-
+  
   String dev = doc["device"];
   device = dev;
-
+  
+  // Build InfluxDB3 line protocol data
+  String table = "home";
   JsonObject obj = doc.as<JsonObject>();
-
+  
+  String influxData = table + ",device_id=" + device;
+  bool firstField = true;
+  
   for (JsonPair p : obj) {
     if (strcmp(p.key().c_str(),"device") == 0) continue; 
-
-    //sprintf(topic,"%s/f/%s.%s",mqtt_server_username,device.c_str(),p.key().c_str());
-    sprintf(topic,"home/%s/%s",device.c_str(),p.key().c_str());
-
-    #ifdef DEBUG
-    //Serial.printf("topic External = %s\n",topic);
-    Serial.printf("topic = %s\n",topic);
-    #endif
-
-    if (p.value().is<char*>()) {
+    if (p.value().is<const char*>()) {
       const char* s = p.value();
-      sprintf(payload,"%s",s);
+      if (!firstField) influxData += ",";
+      else influxData += " ";
+      influxData += String(p.key().c_str()) + "=" + String(s);
     }
-
-    if(p.value().is<float>()) {
+    else if(p.value().is<float>()) {
       float f = p.value();
-      sprintf(payload,"%.4f",f);
+      if (!firstField) influxData += ",";
+      else influxData += " ";
+      influxData += String(p.key().c_str()) + "=" + String(f, 1);
     }
-
-    #ifdef DEBUG
-    Serial.printf("payload External = %s\n",payload );
-    #endif
-
-    if (!mqttClient.publish(topic,payload)) {
-      Serial.println("external publish failed !");
-      retval=false;
+    else if(p.value().is<int>()) {
+      int i = p.value();
+      if (!firstField) influxData += ",";
+      else influxData += " ";
+      influxData += String(p.key().c_str()) + "=" + String(i) + "i";
     }
-
-    /*if (!mqttLocalClient.publish(topicLocal,payload)) {
-      Serial.println("local publish failed !");
-      retval=false;
-    }*/
+    firstField = false;
   }
-  delay(WAIT);
-
-
-  sprintf(topic,"home/%s/snr",device.c_str());
-  sprintf(payload,"%.2f",LoRa.packetSnr());
-  if (!mqttClient.publish(topic,payload)) retval = false;
-  //if (!mqttLocalClient.publish(topicLocal,payload)) retval = false;
-  delay(WAIT);
-
-  sprintf(topic,"home/%s/rssi", device.c_str());
-  sprintf(payload,"%d",LoRa.packetRssi());
-  if (!mqttClient.publish(topic,payload)) retval = false;
-  //if (!mqttLocalClient.publish(topicLocal,payload)) retval = false;
-  delay(WAIT);
-
-  sprintf(topic,"home/%s/frequencyerror", device.c_str());
-  sprintf(payload,"%li",LoRa.packetFrequencyError());
-  if (!mqttClient.publish(topic,payload)) retval = false;
-  //if (!mqttLocalClient.publish(topicLocal,payload)) retval = false;
-  delay(WAIT);
-
-
-  #ifdef DEBUG
-  Serial.print("--> Publish MQTT End : "); Serial.println(retval ? "OK" : "FAILED");
-  #endif
-  return retval;
-}
-
-
-////////////////////////////////
-// Collect data
-////////////////////////////////
-
-bool collectData(){
-  int16_t VCC     = adc0.getConversionP0GND();
-  int16_t vGlobal = adc0.getConversionP2GND();
-  float GlobalmA  = (VCC - vGlobal) * adc0.getMvPerCount();
-
-  currentList[numCollect % 10] = GlobalmA;
-  averageCurrent = 0;
-
-  for (int i=0; i<10; i++) {
-    averageCurrent =  averageCurrent + currentList[i];
-  }
-  averageCurrent =  averageCurrent / 10;
-  return true;
-}
-
-////////////////////////////////
-// Send broker LoRa / JSon Packet
-////////////////////////////////
-
-bool sendBrokerData() {
-  #ifdef DEBUG
-  Serial.println("--> Publish Broker stats");
-  #endif
-  bool retval=true;
-
-  char topic[64];
-  char payload[64];
-
-  int16_t VCC     = adc0.getConversionP0GND();;
-  //int16_t vGlobal = adc0.getConversionP2GND();
-  //float GlobalmA  = (VCC - vGlobal) * adc0.getMvPerCount();
-
-  if (!mqttClient.connected()) reconnect();
   
-  const char dev[]="broker";
+  // Add LoRa metrics
+  influxData += ",rssi=" + String(LoRa.packetRssi()) + "i";
+  influxData += ",snr=" + String(LoRa.packetSnr(), 2);
   
-  //sprintf(topic,"%s/f/%s.vbat", mqtt_server_username,dev);
-  sprintf(topic,"home/%s/vbat", dev);
-  sprintf(payload,"%.4f", VCC * adc0.getMvPerCount() / 1000 );
-  if (!mqttClient.publish(topic,payload)){
-    #ifdef DEBUG
-      Serial.printf("publish to %s with port %d failed !\n", mqtt_server_ip, mqtt_server_port);
-    #endif  
-    retval=false;
   #ifdef DEBUG
-    Serial.printf("topic:[%s] payload:[%s]\n",topic,payload);
+  Serial.print("InfluxDB3 data: ");
+  Serial.println(influxData);
+  
+  String url = "http://" + String(influxdb_server) + ":" + String(influxdb_port) + "/api/v3/write_lp?db=" + String(influxdb_db);
+  Serial.print("InfluxDB3 URL: ");
+  Serial.println(url);
   #endif
-  }
-  delay(WAIT);
-
-  // sprintf(topic,"%s/f/%s.vbatglobal", mqtt_server_username,dev);
-  // sprintf(payload,"%.4f", vGlobal * adc0.getMvPerCount() / 1000 );
-  // if (!mqttClient.publish(topic,payload)) retval=false;
-  // #ifdef DEBUG
-  // Serial.printf("topic:[%s] payload:[%s]\n",topic,payload);
-  // #endif
-  // delay(WAIT);
-
-  // sprintf(topic,"%s/f/%s.last", mqtt_server_username,dev);
-  // tm *myTimeLocal = localtime(&lastReceived);
-  // sprintf(payload,"%s - %02d:%02d:%02d %02d/%02d",device.c_str(), myTimeLocal->tm_hour, myTimeLocal->tm_min, myTimeLocal->tm_sec, myTimeLocal->tm_mday, myTimeLocal->tm_mon + 1);
-  // #ifdef DEBUG
-  // Serial.printf("topic:[%s] payload:[%s]\n",topic,payload);
-  // #endif
-  // if (!mqttClient.publish(topic,payload)) retval=false;
-  // delay(WAIT);
-
-  sprintf(topic,"home/%s/current", dev);
-  sprintf(payload,"%.4f",averageCurrent);
-  #ifdef DEBUG
-    Serial.printf("topic:[%s] payload:[%s]\n",topic,payload);
-  #endif
-  if (!mqttClient.publish(topic,payload)) {
+  
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Authorization", "Bearer " + String(influxdb_token));
+  http.addHeader("Content-Type", "text/plain");
+  
+  int httpResponseCode = http.POST(influxData);
+  
+  if (httpResponseCode > 0) {
     #ifdef DEBUG
-      Serial.printf("publish to %s with port %d failed !\n", mqtt_server_ip, mqtt_server_port);
+    Serial.printf("InfluxDB3 HTTP Response code: %d\n", httpResponseCode);
     #endif
-    retval=false;
-  }
-  delay(WAIT);
-
-  // sprintf(topic,"%s/f/%s.iter", mqtt_server_username,dev);
-  // sprintf(payload,"%li",numiter);
-  // #ifdef DEBUG
-  // Serial.printf("topic:[%s] payload:[%s]\n",topic,payload);
-  // #endif
-  // if (!mqttClient.publish(topic,payload)) retval=false;
-  // delay(WAIT);
-
-  #ifdef DEBUG
-  Serial.print("--> Publish Broker stats END : "); Serial.println(retval ? "OK" : "FAILED");
-  #endif
-  return retval;
-}
-
-////////////////////////////////
-// MQTT specific
-////////////////////////////////
-
-bool reconnect() {
-  bool retval = true;
-
-  #ifdef DEBUG
-  Serial.println("--> reconnect MQTT");
-  #endif
-
-  WiFiConnect();
-
-  Serial.print("Attempting MQTT connection...");
-
-  String clientId = "ESP32Logger-";
-  clientId += String(random(0xffff), HEX);
-
-  for (int i=1 ; i < 11 ; i++) {
-    if (mqttClient.connect(clientId.c_str(),MQTT_LOGIN,MQTT_PASSWD )) {
-      #ifdef DEBUG
-        Serial.println("external connected");
-      #endif
-      retval=true;
-      break;
-    } else {
-      #ifdef DEBUG
-        Serial.print("failed, rc=");
-        Serial.print(mqttClient.state());
-        Serial.print(" try="); Serial.print(i);
-        Serial.println(" try again in 1 seconds");
-      #endif
+    if (httpResponseCode != 204) {
       retval = false;
-      delay(1000);
     }
-    return retval;
+  } else {
+    #ifdef DEBUG
+    Serial.printf("InfluxDB3 HTTP POST failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
+    #endif
+    retval = false;
   }
-
+  
+  http.end();
+  
   #ifdef DEBUG
-  Serial.print("--> reconnect MQTT End : "); Serial.println(retval ? "OK" : "FAILED");
+  Serial.print("--> Send to InfluxDB3 End : "); Serial.println(retval ? "OK" : "FAILED");
   #endif
-
-  return true;
-}
-
-////////////////////////////////
-// Display Statistics
-////////////////////////////////
-
-void displayStats() {
-  //display.ssd1306_command(SSD1306_DISPLAYON);
-  // #ifdef DEBUG
-  // Serial.printf(".");
-  // #endif
-  display.clearDisplay();
-  //display.stopscroll();
-  display.invertDisplay(invert_display);
-  display.setRotation(2);
-  display.setCursor(0,0);
-  char strstate[16]; stateToStr(strstate);
-  display.printf("Broker - %s\n",strstate);
-
-  display.printf("Dev  %s\n",device.c_str());
-  
-  if (timeClient.getSeconds() % 2) display.fillCircle(display.width()-4, display.height()-4,2,0x1);
-  
-  time_t nowTime = timeClient.getEpochTime();
-  tm *n = localtime(&nowTime);
-  display.printf("Time %02d:%02d:%02d %02d/%02d\n",n->tm_hour,n->tm_min,n->tm_sec,n->tm_mday,n->tm_mon+1);
-
-  tm *myTimeLocal = localtime(&lastReceived);
-  display.printf("Last %02d:%02d:%02d\n", myTimeLocal->tm_hour, myTimeLocal->tm_min, myTimeLocal->tm_sec );
-  display.printf("Rx   %3db\n",message.length() );
-  display.printf("RSNR %d %.2f\n",LoRa.packetRssi(),LoRa.packetSnr() );
-  //display.printf("FqErr: %li\n",LoRa.packetFrequencyError());
-
-  if (LoRa.available()) display.drawBitmap(display.width() - LORA_WIDTH, /*display.height()/2*/ 40 - LORA_HEIGHT/2, LoRaLogo, LORA_WIDTH, LORA_HEIGHT, 0x1);
-  // if (!mqttClient.connected()) { display.printf("MQTT : No Cnx\n"); } else {display.printf("MQTT : connected\n"); }
-  // switch (mqttClient.state()) {
-  //   case -4 /*MQTT_CONNECTION_TIMEOUT*/    : display.printf("MQTT cnx timeout!\n"); break;
-  //   case -3 /*MQTT_CONNECTION_LOST*/       : display.printf("MQTT cnx lost!\n"); break;
-  //   case -2 /*MQTT_CONNECT_FAILED*/        : display.printf("MQTT cnx failed!\n"); break;
-  //   case -1 /*MQTT_DISCONNECTED*/          : display.printf("MQTT disconnected\n"); break;
-  //   case 0 /*MQTT_CONNECTED*/              : display.printf("MQTT connected\n"); break;
-  //   case 1 /*MQTT_CONNECT_BAD_PROTOCOL*/   : display.printf("MQTT Bad Protocol!\n"); break;
-  //   case 2 /*MQTT_CONNECT_BAD_CLIENT_ID*/  : display.printf("MQTT BAD ID\n"); break;
-  //   case 3 /*MQTT_CONNECT_UNAVAILABLE*/    : display.printf("MQTT unavailable\n"); break;
-  //   case 4 /*MQTT_CONNECT_BAD_CREDENTIALS*/: display.printf("MQTT BAD CRED!\n"); break;
-  //   case 5 /*MQTT_CONNECT_UNAUTHORIZED*/   : display.printf("MQTT Unauthorized!\n"); break; 
-  //   default:                                 display.printf("MQTT Unknown\n"); break;
-  // }
-
-  if (WiFi.isConnected()) { 
-    display.drawBitmap(display.width() - WIFI_WIDTH, 0, WiFiLogo,WIFI_WIDTH, WIFI_HEIGHT, 0x1); 
-    // display.printf("WiFi %s\r\n",WiFi.localIP().toString().c_str());
-  } else { 
-    display.drawBitmap(display.width() - NOWIFI_WIDTH, 0, noWiFiLogo,NOWIFI_WIDTH, NOWIFI_HEIGHT, 0x1); 
-    // display.printf("WiFi No IP\r\n");
-  }
-
-  int16_t VCC     = adc0.getConversionP0GND();;
-  int16_t vGlobal = adc0.getConversionP2GND();
-  
-  float GlobalmA  = (VCC - vGlobal) * adc0.getMvPerCount();
-  display.printf("Curr %3.0fmA %3.0fmA\n", GlobalmA,averageCurrent);
-  // if (GlobalmA > maxGlobalCurrent) maxGlobalCurrent = (int16_t) GlobalmA;
-  // display.printf("Max   %5dmA\n", maxGlobalCurrent);
-  // int16_t vESP32  = adc0.getConversionP3GND();
-  // float ESP32mA  = (vGlobal - vESP32) * adc0.getMvPerCount();
-  // display.printf("uC    %5.0fmA\n", ESP32mA);
-  display.printf("VCC %5.0fmV\n", VCC * adc0.getMvPerCount() );
-  display.display();
-  delay(20);
-  // #ifdef DEBUG
-  // Serial.printf("\r");
-  // #endif
+  return retval;
 }
