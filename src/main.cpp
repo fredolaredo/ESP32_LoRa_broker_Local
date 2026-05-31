@@ -4,6 +4,11 @@
 #include <SPI.h>
 #include <time.h>
 
+// OTA Update includes
+#include <Update.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
 #define DEBUG
 
 // specifique TTGO lora OLED pins
@@ -37,12 +42,21 @@ enum STATE {
   BROKER,
   DATA,
   SLEEP,
-  ERROR
+  ERROR,
+  OTA_CHECK,
+  OTA_UPDATE
 };
 
 volatile STATE state = INIT;
 volatile STATE prevState;
 volatile int receivedPacketSize = 0;  // Store packet size from interrupt
+
+// OTA Update variables
+unsigned long lastOTACheck = 0;
+String currentFirmwareVersion = "1.0.0";
+
+// OTA Check Timer - Using millis() instead of hardware timer to avoid overflow
+#define OTA_CHECK_INTERVAL_MS 3600000 // 1 hour in milliseconds
 
 void stateToStr(char *text){
   switch(state) {
@@ -56,6 +70,8 @@ void stateToStr(char *text){
     case DATA:      strcpy(text, "DATA"); break;
     case SLEEP:     strcpy(text, "SLEEP"); break;
     case ERROR:     strcpy(text, "ERROR"); break;
+    case OTA_CHECK:  strcpy(text, "OTA_CHECK"); break;
+    case OTA_UPDATE: strcpy(text, "OTA_UPDATE"); break;
     default:        strcpy(text, "UNKNOWN"); break;
   }
 }
@@ -285,6 +301,12 @@ void IRAM_ATTR onDataTimer() {
   portEXIT_CRITICAL_ISR(&mux);
 }
 
+// OTA Update function declarations
+String getCurrentFirmwareVersion();
+bool checkForOTAUpdate();
+bool performOTAUpdate();
+void handleOTAUpdate();
+
 void print_wakeup_reason(){
 
   #ifdef DEBUG
@@ -302,6 +324,355 @@ void print_wakeup_reason(){
     default : Serial.println("Wakeup was not caused by deep sleep"); break;
     
   }
+  #endif
+}
+
+//////////////////////////////
+// OTA Update Functions
+//////////////////////////////
+
+// Get current firmware version from build
+String getCurrentFirmwareVersion() {
+  #if defined(BUILD_VERSION)
+    return String(BUILD_VERSION);
+  #else
+    return currentFirmwareVersion;
+  #endif
+}
+
+// Check if OTA update is available
+bool checkForOTAUpdate() {
+  #if !defined(OTA_ENABLED) || !OTA_ENABLED
+    return false;
+  #endif
+
+  #ifdef DEBUG
+    Serial.println("--> Checking for OTA updates");
+  #endif
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!WiFiConnect()) {
+      #ifdef DEBUG
+        Serial.println("OTA: WiFi connection failed");
+      #endif
+      return false;
+    }
+  }
+
+  String firmwareVersion = getCurrentFirmwareVersion();
+  String checkUrl = "http://" + String(OTA_SERVER) + ":" + String(OTA_PORT) + "/api/firmware/check?device=ESP32_LoRa_broker&version=" + firmwareVersion;
+
+  #ifdef DEBUG
+    Serial.print("OTA Check URL: ");
+    Serial.println(checkUrl);
+  #endif
+
+  HTTPClient http;
+  http.begin(checkUrl);
+  
+  #if defined(OTA_USERNAME) && defined(OTA_PASSWORD)
+    http.setAuthorization(OTA_USERNAME, OTA_PASSWORD);
+  #endif
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode > 0) {
+    if (httpResponseCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      #ifdef DEBUG
+        Serial.print("OTA Version Check Response: ");
+        Serial.println(payload);
+      #endif
+      
+      // Parse response (expected JSON: {"available": true/false, "version": "x.x.x"})
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      
+      if (!error && doc.containsKey("available") && doc["available"].as<bool>()) {
+        #ifdef DEBUG
+          Serial.println("OTA: Update available!");
+          if (doc.containsKey("version")) {
+            Serial.print("New version: ");
+            Serial.println(doc["version"].as<String>());
+          }
+        #endif
+        return true;
+      }
+    } else {
+      #ifdef DEBUG
+        Serial.printf("OTA: HTTP error %d: %s\n", httpResponseCode, http.errorToString(httpResponseCode).c_str());
+      #endif
+    }
+  } else {
+    #ifdef DEBUG
+      Serial.printf("OTA: HTTP request failed: %s\n", http.errorToString(httpResponseCode).c_str());
+    #endif
+  }
+
+  http.end();
+  #ifdef DEBUG
+    Serial.println("--> OTA Check End: No update available");
+  #endif
+  return false;
+}
+
+// Perform OTA update using streaming (avoids memory allocation issues)
+bool performOTAUpdate() {
+  #if !defined(OTA_ENABLED) || !OTA_ENABLED
+    return false;
+  #endif
+
+  #ifdef DEBUG
+    Serial.println("--> Starting OTA Update");
+  #endif
+
+  String firmwareUrl = "http://" + String(OTA_SERVER) + ":" + String(OTA_PORT) + OTA_PATH;
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!WiFiConnect()) {
+      #ifdef DEBUG
+        Serial.println("OTA: WiFi connection failed");
+      #endif
+      return false;
+    }
+  }
+
+  #ifdef DEBUG
+    Serial.print("Firmware URL: ");
+    Serial.println(firmwareUrl);
+  #endif
+
+  HTTPClient http;
+  bool useHTTPS = firmwareUrl.startsWith("https://");
+  
+  if (useHTTPS) {
+    WiFiClientSecure client;
+    #if defined(OTA_FINGERPRINT) && !defined(OTA_SKIP_CERT_CHECK)
+      client.setCACert(OTA_FINGERPRINT);
+    #else
+      client.setInsecure();
+    #endif
+    
+    http.begin(client, firmwareUrl);
+    #if defined(OTA_USERNAME) && defined(OTA_PASSWORD)
+      http.setAuthorization(OTA_USERNAME, OTA_PASSWORD);
+    #endif
+  } else {
+    WiFiClient client;
+    http.begin(client, firmwareUrl);
+    #if defined(OTA_USERNAME) && defined(OTA_PASSWORD)
+      http.setAuthorization(OTA_USERNAME, OTA_PASSWORD);
+    #endif
+  }
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode <= 0) {
+    #ifdef DEBUG
+      Serial.printf("OTA: HTTP request failed: %s\n", http.errorToString(httpResponseCode).c_str());
+    #endif
+    http.end();
+    return false;
+  }
+
+  if (httpResponseCode != HTTP_CODE_OK) {
+    #ifdef DEBUG
+      Serial.printf("OTA: HTTP error %d\n", httpResponseCode);
+    #endif
+    http.end();
+    return false;
+  }
+
+  int firmwareSize = http.getSize();
+  
+  if (firmwareSize <= 0) {
+    #ifdef DEBUG
+      Serial.println("OTA: Could not determine firmware size");
+    #endif
+    http.end();
+    return false;
+  }
+
+  #ifdef DEBUG
+    Serial.print("OTA: Firmware size: ");
+    Serial.print(firmwareSize);
+    Serial.println(" bytes");
+  #endif
+
+  if (!Update.begin(firmwareSize)) {
+    #ifdef DEBUG
+      Serial.print("OTA: Update begin failed: ");
+      Serial.println(Update.errorString());
+    #endif
+    http.end();
+    return false;
+  }
+
+  #ifdef DEBUG
+    Serial.println("OTA: Writing firmware...");
+  #endif
+
+  WiFiClient* clientPtr = http.getStreamPtr();
+  int written = Update.writeStream(*clientPtr);
+  http.end();
+
+  if (written != firmwareSize) {
+    #ifdef DEBUG
+      Serial.printf("OTA: Write failed. Written: %d, Expected: %d\n", written, firmwareSize);
+    #endif
+    Update.end();
+    return false;
+  }
+
+  if (!Update.end(true)) {
+    #ifdef DEBUG
+      Serial.print("OTA: Update end failed: ");
+      Serial.println(Update.errorString());
+    #endif
+    return false;
+  }
+
+  #ifdef DEBUG
+    Serial.println("OTA: Update completed successfully!");
+  #endif
+
+  return true;
+}
+
+// Check and perform OTA update if available
+void handleOTAUpdate() {
+  #if !defined(OTA_ENABLED) || !OTA_ENABLED
+    return;
+  #endif
+
+  #ifdef DEBUG
+    Serial.println("--> Starting OTA update check");
+  #endif
+
+  if (displayFound) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("OTA");
+    display.setCursor(0, 16);
+    display.println("Check...");
+    display.display();
+    lastDisplayUpdate = millis();
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!WiFiConnect()) {
+      #ifdef DEBUG
+        Serial.println("OTA: WiFi connection failed");
+      #endif
+      return;
+    }
+  }
+
+  String checkUrl = "http://" + String(OTA_SERVER) + ":" + String(OTA_PORT) + "/api/firmware/check?device=ESP32_LoRa_broker&version=" + getCurrentFirmwareVersion();
+
+  HTTPClient http;
+  http.begin(checkUrl);
+  
+  #if defined(OTA_USERNAME) && defined(OTA_PASSWORD)
+    http.setAuthorization(OTA_USERNAME, OTA_PASSWORD);
+  #endif
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (!error && doc.containsKey("available") && doc["available"].as<bool>()) {
+      String firmwareUrl = "http://" + String(OTA_SERVER) + ":" + String(OTA_PORT) + OTA_PATH;
+      
+      #ifdef DEBUG
+        Serial.println("Update available, starting download...");
+      #endif
+
+      if (displayFound) {
+        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("OTA");
+        display.setCursor(0, 16);
+        display.println("Download...");
+        display.display();
+        lastDisplayUpdate = millis();
+      }
+
+      if (performOTAUpdate()) {
+        #ifdef DEBUG
+          Serial.println("Rebooting after OTA update...");
+        #endif
+        
+        if (displayFound) {
+          display.clearDisplay();
+          display.setTextSize(2);
+          display.setTextColor(SSD1306_WHITE);
+          display.setCursor(0, 0);
+          display.println("Reboot");
+          display.setCursor(0, 16);
+          display.println("in 5s");
+          display.display();
+          delay(5000);
+        }
+        
+        ESP.restart();
+      } else {
+        if (displayFound) {
+          display.clearDisplay();
+          display.setTextSize(2);
+          display.setTextColor(SSD1306_WHITE);
+          display.setCursor(0, 0);
+          display.println("OTA");
+          display.setCursor(0, 16);
+          display.println("Failed!");
+          display.display();
+          lastDisplayUpdate = millis();
+        }
+      }
+    } else {
+      #ifdef DEBUG
+        Serial.println("No update available");
+      #endif
+      if (displayFound) {
+        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("OTA");
+        display.setCursor(0, 16);
+        display.println("Up2date");
+        display.display();
+        lastDisplayUpdate = millis();
+      }
+    }
+  } else {
+    #ifdef DEBUG
+      Serial.printf("OTA check failed: %d - %s\n", httpResponseCode, http.errorToString(httpResponseCode).c_str());
+    #endif
+    if (displayFound) {
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("OTA");
+      display.setCursor(0, 16);
+      display.println("Error");
+      display.display();
+      lastDisplayUpdate = millis();
+    }
+  }
+  
+  http.end();
+  #ifdef DEBUG
+    Serial.println("--> OTA update check completed");
   #endif
 }
 
@@ -446,6 +817,14 @@ void setup() {
   Serial.println("LoRa started OK in receive mode");
   #endif
   
+  // Initialize OTA last check time
+  #ifdef OTA_ENABLED
+    lastOTACheck = millis();
+    #ifdef DEBUG
+      Serial.println("OTA Update Checker initialized");
+    #endif
+  #endif
+  
   #ifdef DEBUG
   Serial.println("--------- SETUP ENDED ---------");
   #endif
@@ -479,6 +858,14 @@ void loop() {
       display.clearDisplay();
       display.display();
     }
+    
+    // Check for OTA updates periodically
+    #if defined(OTA_ENABLED) && OTA_ENABLED
+    if (millis() - lastOTACheck >= OTA_CHECK_INTERVAL_MS) {
+      lastOTACheck = millis();
+      state = OTA_CHECK;
+    }
+    #endif
     break;
 
   case RECEIVING: {
@@ -566,6 +953,16 @@ void loop() {
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_32,1);
     esp_deep_sleep_start();
     state=WAIT;
+    break;
+
+  case OTA_CHECK:
+    handleOTAUpdate();
+    state = WAIT;
+    break;
+
+  case OTA_UPDATE:
+    handleOTAUpdate();
+    state = WAIT;
     break;
 
   default:
